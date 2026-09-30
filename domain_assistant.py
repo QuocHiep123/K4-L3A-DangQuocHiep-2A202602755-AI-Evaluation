@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -266,6 +267,81 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash", max_output_tokens: int = 300) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.max_output_tokens = max_output_tokens
+
+    def generate(self, prompt: str) -> str:
+        import json
+        import urllib.error
+        import urllib.request
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": self.max_output_tokens,
+            },
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        for attempt in range(6):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                    candidates = result.get("candidates", [])
+                    if not candidates:
+                        raise RuntimeError("Gemini returned no candidates")
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    answer = "".join(p.get("text", "") for p in parts).strip()
+                    if not answer:
+                        raise RuntimeError("Gemini returned empty answer")
+                    return answer
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 503) and attempt < 5:
+                    wait_time = 10 * (attempt + 1)
+                    time.sleep(wait_time)
+                    continue
+                err_body = exc.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"Gemini API error ({exc.code}): {err_body}") from exc
+            except Exception as exc:
+                if attempt < 3:
+                    time.sleep(5)
+                    continue
+                raise RuntimeError(f"Gemini request failed: {exc}") from exc
+        raise RuntimeError("Gemini requests exceeded maximum retry attempts")
+
+
+def _create_default_generator() -> TextGenerator:
+    gemini_key = (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or ""
+    ).strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if gemini_key:
+        model = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_MODEL") or "gemini-2.0-flash").strip()
+        return GeminiGenerator(api_key=gemini_key, model=model)
+    elif openai_key and openai_key != "your_openai_api_key_here":
+        if openai_key.startswith("AIzaSy"):
+            model = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+            return GeminiGenerator(api_key=openai_key, model=model)
+        return OpenAIGenerator()
+    else:
+        raise RuntimeError(
+            "Chưa cấu hình API Key trong file .env. "
+            "Vui lòng điền GEMINI_API_KEY hoặc OPENAI_API_KEY vào .env"
+        )
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,9 +375,10 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else _create_default_generator(),
             top_k,
         )
+
 
     def retrieve(self, question: str) -> list[str]:
         return [chunk.text for chunk in self.retriever.retrieve(question, self.top_k)]
@@ -405,6 +482,17 @@ def generate_actual_answers(
         f"model={model}, top_k={top_k}"
     )
 
+    artifact_path = Path("artifacts/actual_answers.json")
+    existing_by_id: dict[str, Any] = {}
+    if artifact_path.exists():
+        try:
+            cached_data = json.loads(artifact_path.read_text(encoding="utf-8"))
+            for ans in cached_data.get("answers", []):
+                if ans.get("id") and ans.get("actual_answer"):
+                    existing_by_id[ans["id"]] = ans
+        except Exception:
+            pass
+
     answers: list[dict[str, Any]] = []
     for index, item in enumerate(questions, start=1):
         percentage = index / total
@@ -414,6 +502,15 @@ def generate_actual_answers(
         question_preview = re.sub(r"\s+", " ", item["question"]).strip()
         if len(question_preview) > 58:
             question_preview = f"{question_preview[:55]}..."
+
+        if item["id"] in existing_by_id:
+            answers.append(existing_by_id[item["id"]])
+            notify(
+                f"[{bar_before}] {completed_before:02d}/{total:02d} | "
+                f"{item['id']} Cached: {question_preview}"
+            )
+            continue
+
         notify(
             f"[{bar_before}] {completed_before:02d}/{total:02d} | "
             f"{item['id']} generating: {question_preview}"
@@ -444,6 +541,25 @@ def generate_actual_answers(
             }
         )
 
+        # Progressive save so no progress is lost
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_data = {
+            "schema_version": "1.0",
+            "corpus_id": assistant.corpus_id,
+            "generated_at": datetime.now(UTC).isoformat(),
+            "agent": {
+                "name": "domain-assistant",
+                "model": model,
+                "top_k": top_k,
+                "prompt_version": "1.0",
+            },
+            "answers": answers,
+        }
+        artifact_path.write_text(
+            json.dumps(partial_data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         filled_after = round(20 * percentage)
         bar_after = "#" * filled_after + "-" * (20 - filled_after)
         elapsed = time.perf_counter() - started_at
@@ -451,6 +567,7 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        time.sleep(3)
 
     return {
         "schema_version": "1.0",
@@ -493,6 +610,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args()
     try:
         artifact = generate_actual_answers(
